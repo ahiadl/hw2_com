@@ -4,7 +4,9 @@
 #include "bp_api.h"
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <math.h>
+//#include <stdbool.h>
+//#include <types.h>
 /****defines & enums ****/
 #define ONES          0xffffffff
 #define IP_ROOT       0x0
@@ -53,6 +55,13 @@ typedef struct{
 Btb GBtb;
 SIM_stats stats;
 
+
+unsigned log_btb (unsigned num){
+    unsigned logBtb=0;
+    while(num>1){logBtb++; num=num>>1;}
+    //if (DEBUG) printf("LOG: %d \n",logBtb );
+    return logBtb;
+}
 
 /***********************************************************************************************/
 int BP_init(unsigned btbSize, unsigned historySize, unsigned tagSize, bool isGlobalHist, bool isGlobalTable, bool isShare){
@@ -147,19 +156,20 @@ int BP_init(unsigned btbSize, unsigned historySize, unsigned tagSize, bool isGlo
 /***********************************************************************************************/
 bool BP_predict(uint32_t pc, uint32_t *dst){
     if(DEBUG) printf("Started predicting\n");
-    int btbIdx = ((pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-(GBtb.Params.btbSize-1))));
-    if(DEBUG) printf("calculated IDX: %d, btbSize: %d, ONES-btb: %d", btbIdx, GBtb.Params.btbSize, (ONES >> (PC_SIZE-GBtb.Params.btbSize)));
-    if(DEBUG) printf("pc: %d, pc_size-historysize: %d history: \n",pc >> PC_BIT_ALIGN, ONES>>(PC_SIZE-GBtb.Params.historySize));//, *GBtb.Data[btbIdx]->history);
+    int btbIdx = ((pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-log_btb(GBtb.Params.btbSize))));
+    if(DEBUG) printf("calculated IDX: %d, btbSize: %d, ONES-btb: 0x%x", btbIdx, GBtb.Params.btbSize, (ONES >> (PC_SIZE-log_btb(GBtb.Params.btbSize))));
+    if(DEBUG) printf("pc: 0x%x, pc_size-historysize: %d history: 0x%x\n",pc >> PC_BIT_ALIGN, ONES>>(PC_SIZE-GBtb.Params.historySize), *GBtb.Data[btbIdx]->history);
     int tableCell = (GBtb.Params.isShare && GBtb.Params.isGlobalTable) ? 
                     (((pc >> PC_BIT_ALIGN) & (ONES>>(PC_SIZE-GBtb.Params.historySize)))^(*GBtb.Data[btbIdx]->history)) : *GBtb.Data[btbIdx]->history;
-    if(DEBUG) printf("Done calculating IDX and Table Cell\n");
+    if(DEBUG) printf("Done calculating IDX and Table Cell 0x%x\n",tableCell);
     if (GBtb.Data[btbIdx]->valid) {
         if(DEBUG) printf("Valid On\n");   
         int tagCalc = (pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-GBtb.Params.tagSize));
         if (tagCalc == GBtb.Data[btbIdx]->tag){
-            if(DEBUG) printf("Same Tag\n");   
+            if(DEBUG) printf("Same Tag\n");
+            if(DEBUG) printf("cell content: %d \n",GBtb.Data[btbIdx]->table[tableCell]);
             if (BR_WT == (GBtb.Data[btbIdx]->table[tableCell] & BR_WT)){
-                *dst = GBtb.Data[btbIdx]->predictedPc;
+                	*dst = GBtb.Data[btbIdx]->predictedPc;
                 if(DEBUG) printf("Predicted\n");   
                 return true; 
             }
@@ -172,15 +182,16 @@ bool BP_predict(uint32_t pc, uint32_t *dst){
 /***********************************************************************************************/
 void BP_update(uint32_t pc, uint32_t targetPc, bool taken, uint32_t pred_dst){
 //we assume that there are no branch cmds to pc+4 - hence if (targetPc == pred_dst) then the prediction was correct 
-   stats.flush_num += (pred_dst == targetPc);
+   stats.flush_num += ((taken && (pred_dst != targetPc)) || (!taken && (pred_dst != pc+PC_GAP)));
    stats.br_num++;
-   int btbIdx = ((pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-GBtb.Params.btbSize-1)));
+   int btbIdx = ((pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-log_btb(GBtb.Params.btbSize))));
    int tagCalc = (pc>>PC_BIT_ALIGN) & (ONES >> (PC_SIZE-GBtb.Params.tagSize));   
    int tableCell = (GBtb.Params.isShare && GBtb.Params.isGlobalTable) ? 
                    (((pc >> PC_BIT_ALIGN) & (ONES>>(PC_SIZE-GBtb.Params.historySize)))^(*GBtb.Data[btbIdx]->history)) : *GBtb.Data[btbIdx]->history;
-   if (GBtb.Data[btbIdx]->valid) { 
-       if (tagCalc == GBtb.Data[btbIdx]->tag){
-           *GBtb.Data[btbIdx]->history = ((*GBtb.Data[btbIdx]->history << BIT) | taken);
+   if (GBtb.Data[btbIdx]->valid && tagCalc == GBtb.Data[btbIdx]->tag) {
+       //if (tagCalc == GBtb.Data[btbIdx]->tag){
+           *GBtb.Data[btbIdx]->history = (ONES>>(PC_SIZE-GBtb.Params.historySize)) & ((*GBtb.Data[btbIdx]->history << BIT) +taken);
+           if(DEBUG) printf("History: %d\n", *GBtb.Data[btbIdx]->history);
            switch (GBtb.Data[btbIdx]->table[tableCell]){
                case BR_ST:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WT;  break;
                case BR_WT:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WNT; break;
@@ -189,23 +200,25 @@ void BP_update(uint32_t pc, uint32_t targetPc, bool taken, uint32_t pred_dst){
                default : break;
            }
            //if(taken) GBtb.Data[btbIdx].predictedPc = targetPc;
-       }
+      // }
    }else{
        
        if(!GBtb.Params.isGlobalHist)  *GBtb.Data[btbIdx]->history = CLEAR_HISTORY | taken; 
-       else *GBtb.Data[btbIdx]->history = ((*GBtb.Data[btbIdx]->history << BIT) | taken);
+       else *GBtb.Data[btbIdx]->history = (ONES>>(PC_SIZE-GBtb.Params.historySize)) & ((*GBtb.Data[btbIdx]->history << BIT) +taken);
        int cellToDel;
        if(!GBtb.Params.isGlobalTable) for(cellToDel = 0; cellToDel<(BIT<<GBtb.Params.historySize) ; cellToDel++) GBtb.Data[btbIdx]->table[cellToDel] = BR_WNT;  
-       else switch (GBtb.Data[btbIdx]->table[tableCell]){
-               case BR_ST:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WT;  break;
-               case BR_WT:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WNT; break;
-               case BR_WNT: GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_WT  : BR_SNT; break;
-               case BR_SNT: GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_WNT : BR_SNT; break;
-               default : break;
-            }
+       switch (GBtb.Data[btbIdx]->table[tableCell]){
+           case BR_ST:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WT;  break;
+           case BR_WT:  GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_ST  : BR_WNT; break;
+           case BR_WNT: GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_WT  : BR_SNT; break;
+           case BR_SNT: GBtb.Data[btbIdx]->table[tableCell] = taken ? BR_WNT : BR_SNT; break;
+           default : break;
+       }
        GBtb.Data[btbIdx]->tag = tagCalc;
+       GBtb.Data[btbIdx]->valid = true;
    }  
    if(taken) GBtb.Data[btbIdx]->predictedPc = targetPc;
+   if(DEBUG) printf("cell content(updated): %d \n",GBtb.Data[btbIdx]->table[tableCell]);
    return;
 }
 /***********************************************************************************************/
